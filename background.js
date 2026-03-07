@@ -68,10 +68,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const newState = message.state;
       if (!newState || !tabId) break;
 
-      // Register this tab as active as soon as it reports any state
-      // (not just when isPlaying — fixes "Loading..." stuck on paused start)
+      // Register this tab as active as soon as it reports state.
+      // If this tab is playing, always promote it so controls target the right tab.
       if (isSupportedSite(sender.tab?.url)) {
-        if (activeMediaTab === null || activeMediaTab === tabId) {
+        if (activeMediaTab === null || activeMediaTab === tabId || newState.isPlaying) {
           setActiveTab(tabId);
         }
       }
@@ -157,8 +157,8 @@ function setActiveTab(tabId) {
   // Tell the active tab it owns playback controls
   chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
 
-  // Tell all other tabs they are observers
-  broadcastToAllTabs({ type: "ACTIVE_TAB_CHANGED" }, tabId);
+  // Tell all other tabs they are observers and provide latest state so they can render immediately
+  broadcastToAllTabs({ type: "ACTIVE_TAB_CHANGED", state: lastBroadcastState }, tabId);
 }
 
 function isSupportedSite(url) {
