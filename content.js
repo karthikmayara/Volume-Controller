@@ -287,10 +287,15 @@ function detectPlatform() {
       const state = platform.getState();
       if (!state) return;
 
-      safeSend({ type: "MEDIA_STATE_UPDATE", state });
-      renderState(state);
-      showIsland();
-      isThisTabActive = true;
+      safeSend({ type: "MEDIA_STATE_UPDATE", state }, (response) => {
+        const active = !!response?.isActive;
+        isThisTabActive = active;
+        // Render directly only on the active media tab. Observer tabs render from broadcasts.
+        if (active) {
+          renderState(state);
+          showIsland();
+        }
+      });
     }, 500);
   }
 

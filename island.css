@@ -10,10 +10,10 @@
   --vc-font-ui:   "SF Pro Display", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
   --vc-font-mono: "SF Mono", "Cascadia Mono", "Fira Mono", ui-monospace, monospace;
 
-  --vc-bg:          rgba(14, 14, 16, 0.95);
-  --vc-border:      rgba(255, 255, 255, 0.10);
+  --vc-bg:          rgba(0, 0, 0, 0.96);
+  --vc-border:      rgba(255, 255, 255, 0.18);
   --vc-text:        rgba(255, 255, 255, 0.95);
-  --vc-muted:       rgba(255, 255, 255, 0.50);
+  --vc-muted:       rgba(255, 255, 255, 0.82);
   --vc-accent:      #a8ff78;
   --vc-accent-dim:  rgba(168, 255, 120, 0.18);
   --vc-accent-hover:rgba(168, 255, 120, 0.30);
@@ -124,7 +124,7 @@
   align-items: center !important;
   justify-content: center !important;
   font-size: 20px !important;
-  color: var(--vc-muted) !important;
+  color: var(--vc-text) !important;
 }
 
 /* ─── Track info ──────────────────────────────────────────── */
@@ -239,14 +239,17 @@
 
 #vc-progress-wrap {
   margin-top: 12px !important;
-  padding: 0 8px !important;
+  padding: 10px 10px 8px !important;
   box-sizing: border-box !important;
+  background: rgba(0,0,0,0.96) !important;
+  border: 1px solid rgba(255,255,255,0.16) !important;
+  border-radius: 14px !important;
 }
 
 #vc-progress-bar {
   position: relative !important;
   height: 8px !important;
-  background: rgba(255,255,255,0.10) !important;
+  background: rgba(255,255,255,0.18) !important;
   border-radius: 8px !important;
   cursor: pointer !important;
   overflow: visible !important;
@@ -287,11 +290,12 @@
 #vc-time {
   display: flex !important;
   justify-content: space-between !important;
-  margin-top: 5px !important;
+  margin-top: 6px !important;
   font-family: var(--vc-font-mono) !important;
   font-size: 12px !important;
-  color: var(--vc-muted) !important;
+  color: var(--vc-text) !important;
   letter-spacing: 0.02em !important;
+  opacity: 0.95 !important;
 }
 
 /* ─── Platform accent themes ──────────────────────────────── */

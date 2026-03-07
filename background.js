@@ -92,6 +92,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // shows the island — excludes only the sender to avoid echo
         broadcastToAllTabs({ type: "MEDIA_STATE_UPDATE", state: newState }, tabId);
       }
+
+      // Tell sender whether it is currently the active media owner.
+      sendResponse({ ok: true, isActive: activeMediaTab === tabId });
       break;
     }
 
