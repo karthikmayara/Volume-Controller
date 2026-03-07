@@ -33,12 +33,13 @@ const YouTube = {
     const v = this.getVideo();
     if (!v) return null;
     const meta = navigator.mediaSession?.metadata;
-    // Resolve artwork — mediaSession gives absolute URLs, fallback to thumbnail
-    let artwork = meta?.artwork?.[0]?.src || "";
+    // Resolve artwork — pick the largest mediaSession image first.
+    let artwork = pickBestArtwork(meta?.artwork) || "";
     if (!artwork) {
       // Try to extract video ID from URL for thumbnail
       const match = location.href.match(/[?&]v=([^&]+)/);
       if (match) artwork = `https://img.youtube.com/vi/${match[1]}/mqdefault.jpg`;
+      if (!artwork) artwork = pickMetaImage();
     }
     return {
       platform:    "youtube",
@@ -87,7 +88,7 @@ const YouTubeMusic = {
       duration:    v.duration || 0,
       title:       meta?.title  || titleEl?.textContent?.trim() || "",
       artist:      meta?.artist || artEl?.textContent?.trim()   || "",
-      artwork:     meta?.artwork?.[0]?.src || "",
+      artwork:     pickBestArtwork(meta?.artwork) || pickMetaImage() || "",
       volume:      v.volume,
       muted:       v.muted
     };
@@ -114,22 +115,66 @@ const Spotify = {
   getState() {
     const meta      = navigator.mediaSession?.metadata;
     const isPlaying = navigator.mediaSession?.playbackState === "playing";
-    const pb        = document.querySelector('[data-testid="playback-progressbar"] [role="progressbar"]');
-    const timeEls   = document.querySelectorAll('[data-testid="playback-duration"]');
+    const pb        = document.querySelector('[data-testid="playback-progressbar"] [role="progressbar"], [data-testid="playback-progressbar"]');
+    const currentEl = document.querySelector('[data-testid="playback-position"], [data-testid="playback-position-time"], [aria-label*="elapsed" i]');
+    const totalEl   = document.querySelector('[data-testid="playback-duration"], [aria-label*="total" i]');
     let currentTime = 0, duration = 0;
-    if (timeEls.length >= 2) {
-      currentTime = parseMMSS(timeEls[0]?.textContent);
-      duration    = parseMMSS(timeEls[1]?.textContent);
+    if (currentEl && totalEl) {
+      currentTime = parseMMSS(currentEl.textContent);
+      duration    = parseMMSS(totalEl.textContent);
+    } else {
+      const timeEls = Array.from(document.querySelectorAll('[data-testid="playback-duration"], [data-testid="playback-position"]'))
+        .map((el) => parseMMSS(el.textContent))
+        .filter((v) => Number.isFinite(v) && v > 0)
+        .sort((a, b) => a - b);
+      if (timeEls.length >= 2) {
+        currentTime = timeEls[0];
+        duration = timeEls[timeEls.length - 1];
+      }
+    }
+
+    if ((!duration || duration < currentTime) && pb) {
+      const valueNow = parseFloat(pb.getAttribute("aria-valuenow") || 0);
+      const valueMax = parseFloat(pb.getAttribute("aria-valuemax") || 0);
+      if (valueMax > 0) {
+        currentTime = valueNow;
+        duration = valueMax;
+      }
+    }
+
+    if ((!duration || duration < currentTime) && meta?.length) {
+      duration = meta.length;
+      if (!currentTime && !isPlaying) currentTime = 0;
+    }
+
+    if (duration && currentTime > duration) {
+      currentTime = duration;
+    }
+
+    if (duration <= 0) {
+      const fallback = document.querySelector('[aria-valuemin][aria-valuemax]');
+      if (fallback) {
+        const now = parseFloat(fallback.getAttribute("aria-valuenow") || 0);
+        const max = parseFloat(fallback.getAttribute("aria-valuemax") || 0);
+        if (max > 0) {
+          currentTime = now;
+          duration = max;
+        }
+      }
+    }
+
+    if (duration <= 0 || Number.isNaN(duration)) {
+      currentTime = 0;
+      duration = 0;
     } else if (pb) {
-      currentTime = parseFloat(pb.getAttribute("aria-valuenow") || 0);
-      duration    = parseFloat(pb.getAttribute("aria-valuemax")  || 0);
+      currentTime = Math.max(0, Number.isFinite(currentTime) ? currentTime : 0);
     }
     return {
       platform: "spotify",
       isPlaying, currentTime, duration,
       title:   meta?.title             || "",
       artist:  meta?.artist            || "",
-      artwork: meta?.artwork?.[0]?.src || "",
+      artwork: pickBestArtwork(meta?.artwork) || pickMetaImage() || "",
       volume: null, muted: false
     };
   }
@@ -141,6 +186,31 @@ function parseMMSS(str) {
   if (p.length === 2) return p[0] * 60 + p[1];
   if (p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
   return 0;
+}
+
+function pickBestArtwork(artworks = []) {
+  if (!Array.isArray(artworks) || artworks.length === 0) return "";
+  const sorted = [...artworks]
+    .filter((img) => img?.src)
+    .sort((a, b) => {
+      const aSize = parseInt(a?.sizes?.split("x")?.[0] || "0", 10);
+      const bSize = parseInt(b?.sizes?.split("x")?.[0] || "0", 10);
+      return bSize - aSize;
+    });
+  return sorted[0]?.src || "";
+}
+
+function pickMetaImage() {
+  const selectors = [
+    'meta[property="og:image:secure_url"]',
+    'meta[property="og:image"]',
+    'meta[name="twitter:image"]'
+  ];
+  for (const sel of selectors) {
+    const value = document.querySelector(sel)?.getAttribute("content");
+    if (value) return value;
+  }
+  return "";
 }
 
 function detectPlatform() {
@@ -217,10 +287,15 @@ function detectPlatform() {
       const state = platform.getState();
       if (!state) return;
 
-      safeSend({ type: "MEDIA_STATE_UPDATE", state });
-      renderState(state);
-      showIsland();
-      isThisTabActive = true;
+      safeSend({ type: "MEDIA_STATE_UPDATE", state }, (response) => {
+        const active = !!response?.isActive;
+        isThisTabActive = active;
+        // Render directly only on the active media tab. Observer tabs render from broadcasts.
+        if (active) {
+          renderState(state);
+          showIsland();
+        }
+      });
     }, 500);
   }
 
@@ -251,6 +326,12 @@ function detectPlatform() {
       // Another tab took over — we become a passive observer
       case "ACTIVE_TAB_CHANGED":
         isThisTabActive = false;
+        if (message.state) {
+          renderState(message.state);
+          showIsland();
+        } else if (lastState) {
+          showIsland();
+        }
         break;
 
       // Active media tab closed — hide island on all observer tabs
@@ -450,8 +531,8 @@ function detectPlatform() {
 
       const onMove = (e) => {
         e.preventDefault();
-        dom.island.style.right  = Math.max(8, startRight  - (e.clientX - startX)) + "px";
-        dom.island.style.bottom = Math.max(8, startBottom - (e.clientY - startY)) + "px";
+        dom.island.style.setProperty("right", `${Math.max(8, startRight - (e.clientX - startX))}px`, "important");
+        dom.island.style.setProperty("bottom", `${Math.max(8, startBottom - (e.clientY - startY))}px`, "important");
       };
       const onUp = () => {
         dom.island.style.transition = "";
