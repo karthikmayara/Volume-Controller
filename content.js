@@ -321,6 +321,12 @@ function detectPlatform() {
       // Another tab took over — we become a passive observer
       case "ACTIVE_TAB_CHANGED":
         isThisTabActive = false;
+        if (message.state) {
+          renderState(message.state);
+          showIsland();
+        } else if (lastState) {
+          showIsland();
+        }
         break;
 
       // Active media tab closed — hide island on all observer tabs

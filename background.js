@@ -157,8 +157,8 @@ function setActiveTab(tabId) {
   // Tell the active tab it owns playback controls
   chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
 
-  // Tell all other tabs they are observers
-  broadcastToAllTabs({ type: "ACTIVE_TAB_CHANGED" }, tabId);
+  // Tell all other tabs they are observers and provide latest state so they can render immediately
+  broadcastToAllTabs({ type: "ACTIVE_TAB_CHANGED", state: lastBroadcastState }, tabId);
 }
 
 function isSupportedSite(url) {
