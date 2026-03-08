@@ -64,3 +64,28 @@ Expected:
 Expected:
 - Island should stay locked to the active owner (YouTube Music) with no title/artwork flicker.
 - Owner should not bounce due transient tab activation or delayed audible updates.
+
+
+## Scenario I: Cross-window owner switch
+1. Open Window A with YouTube playing.
+2. Open Window B with Spotify and start playback.
+
+Expected:
+- Owner switches to Spotify (Window B) after promotion delay.
+- Observer island in Window A updates source badge without flicker.
+
+## Scenario J: Cross-window owner close fallback
+1. Keep owner in Window B and secondary playing source in Window A.
+2. Close owner tab in Window B.
+
+Expected:
+- Ownership falls back to Window A source.
+- Play/Pause/Seek from any observer tab still routes correctly.
+
+## Scenario K: Action acknowledgment and failure feedback
+1. Trigger play/pause/seek/volume from observer tab while owner is alive.
+2. Then close owner tab and trigger another action.
+
+Expected:
+- While healthy: status briefly shows syncing and clears on ack.
+- After owner close: status shows actionable error message instead of silent fail.

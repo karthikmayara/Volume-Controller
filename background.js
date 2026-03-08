@@ -13,6 +13,7 @@ let stateSeq = 0;
 let preferredVolume = null;
 let preferredMuted = null;
 const OWNER_SWITCH_DELAY_MS = 900;
+const DEBUG_OWNER = false;
 
 /** @type {Map<number, {platform:string,isPlaying:boolean,lastPlayingAt:number,lastStateAt:number}>} */
 const mediaTabs = new Map();
@@ -60,7 +61,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const tabId = sender.tab?.id;
       const incoming = message.state;
       if (!tabId || !incoming || !isSupportedSite(sender.tab?.url || "")) {
-        sendResponse?.({ ok: false, isActive: false });
+        sendResponse?.({ ok: false, isActive: false, reason: "Unsupported sender" });
         break;
       }
 
@@ -71,6 +72,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (tabId === activeMediaTab) {
         if (typeof incoming.volume === "number" && Number.isFinite(incoming.volume)) {
           preferredVolume = clamp01(incoming.volume);
+        }
+        if (typeof incoming.muted === "boolean") {
+          preferredMuted = incoming.muted;
         }
         if (typeof incoming.muted === "boolean") {
           preferredMuted = incoming.muted;
@@ -89,6 +93,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       } else if (tabId === activeMediaTab && !incoming.isPlaying) {
         recalcActiveTab();
       } else if (transitionedToPlaying && tabId !== activeMediaTab) {
+        schedulePromotion(tabId);
+      }
+
+      mediaTabs.set(tabId, {
+        platform: incoming.platform || prev?.platform || "",
+        isPlaying: !!incoming.isPlaying,
+        lastPlayingAt: transitionedToPlaying ? now : (prev?.lastPlayingAt || 0),
+        lastStateAt: now
+      });
+
+      if (activeMediaTab === null) {
+        dlog("owner:init", { tabId, platform: incoming.platform });
+        setActiveTab(tabId, incoming);
+      } else if (tabId === activeMediaTab && !incoming.isPlaying) {
+        dlog("owner:active-stopped", { tabId });
+        recalcActiveTab();
+      } else if (transitionedToPlaying && tabId !== activeMediaTab) {
+        dlog("owner:promotion-scheduled", { from: activeMediaTab, to: tabId });
         schedulePromotion(tabId);
       }
 
@@ -116,7 +138,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case "MEDIA_ACTION": {
       if (activeMediaTab === null) {
-        sendResponse({ ok: false, error: "No active media tab" });
+        sendResponse({ ok: false, action: message.action, reason: "No active media tab" });
         return;
       }
 
@@ -134,14 +156,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         type: "EXECUTE_MEDIA_ACTION",
         action: message.action,
         value: message.value
-      }).then(() => {
-        sendResponse({ ok: true, ownerTabId: activeMediaTab });
+      }).then((result) => {
+        if (result?.ok === false) {
+          sendResponse({ ok: false, action: message.action, ownerTabId: activeMediaTab, reason: result.reason || "Owner rejected action" });
+          return;
+        }
+        sendResponse({ ok: true, action: message.action, ownerTabId: activeMediaTab });
       }).catch((err) => {
         clearPromotionTimer(activeMediaTab);
         mediaTabs.delete(activeMediaTab);
         activeMediaTab = null;
         recalcActiveTab();
-        sendResponse({ ok: false, error: err.message });
+        sendResponse({ ok: false, action: message.action, reason: err.message });
       });
       return true;
     }
@@ -171,6 +197,10 @@ chrome.commands.onCommand.addListener((command) => {
   if (command === "toggle-island") broadcastToAllTabs({ type: "TOGGLE_ISLAND" });
 });
 
+function dlog(...args) {
+  if (DEBUG_OWNER) console.debug("[VC][bg]", ...args);
+}
+
 function withStateMeta(state) {
   stateSeq += 1;
   chrome.storage.session.set({ stateSeq });
@@ -183,6 +213,7 @@ function withStateMeta(state) {
 
 function setActiveTab(tabId, ownerState = null) {
   if (tabId === activeMediaTab) return;
+  dlog("owner:set", { from: activeMediaTab, to: tabId });
   clearPromotionTimer(tabId);
   activeMediaTab = tabId;
   chrome.storage.session.set({ activeMediaTab: tabId });
@@ -208,6 +239,7 @@ function recalcActiveTab() {
     .sort((a, b) => (b[1].lastPlayingAt - a[1].lastPlayingAt) || (b[1].lastStateAt - a[1].lastStateAt));
 
   if (candidates.length === 0) {
+    dlog("owner:cleared");
     activeMediaTab = null;
     chrome.storage.session.remove("activeMediaTab");
     return;
@@ -221,6 +253,7 @@ function recalcActiveTab() {
 function schedulePromotion(tabId) {
   clearPromotionTimer(tabId);
   const timer = setTimeout(() => {
+    dlog("owner:promotion-fired", { tabId });
     promotionTimers.delete(tabId);
     const entry = mediaTabs.get(tabId);
     if (!entry?.isPlaying) return;
