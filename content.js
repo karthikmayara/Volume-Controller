@@ -18,8 +18,22 @@ const YouTube = {
   getVideo() {
     return document.querySelector("video.html5-main-video") || document.querySelector("video");
   },
-  play()  { this.getVideo()?.play(); },
-  pause() { this.getVideo()?.pause(); },
+  play() {
+    const v = this.getVideo();
+    if (!v) return;
+    if (v.paused) {
+      document.querySelector(".ytp-play-button")?.click();
+      if (v.paused) v.play().catch(() => {});
+    }
+  },
+  pause() {
+    const v = this.getVideo();
+    if (!v) return;
+    if (!v.paused) {
+      document.querySelector(".ytp-play-button")?.click();
+      if (!v.paused) v.pause();
+    }
+  },
   next()  { document.querySelector(".ytp-next-button")?.click(); },
   previous() {
     const v = this.getVideo();
@@ -282,8 +296,6 @@ function detectPlatform() {
   function startPolling() {
     pollingTimer = setInterval(() => {
       if (!isContextAlive()) { stopPolling(); return; }
-      if (document.hidden) return;
-
       const state = platform.getState();
       if (!state) return;
 
