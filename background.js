@@ -1,117 +1,181 @@
 /**
  * background.js
- * Central state manager for the Volume Controller extension.
+ * Central media ownership + routing manager.
  *
- * Key fixes in this version:
- * - broadcastToAllContentScripts sends to ALL tabs (not just supported sites)
- *   so the island appears on any tab the user is browsing
- * - activeMediaTab promoted immediately on first MEDIA_STATE_UPDATE regardless
- *   of isPlaying, so paused-on-load state still registers the tab
- * - YOU_ARE_ACTIVE sent to active tab so it knows to act locally
- * - shouldBroadcast always passes through for the media tab's own updates
+ * Ownership rule:
+ * - last tab that transitions into playing becomes active owner
+ * - if owner stops/closes, fallback to most recently-playing remaining tab
  */
 
-let activeMediaTab    = null;
+let activeMediaTab = null;
 let lastBroadcastState = null;
+let stateSeq = 0;
 
-// ─── Rehydrate on service worker restart ─────────────────────────────────────
+let volumeMode = "global"; // global | per-platform
+let debugOwner = false;
 
-chrome.storage.session.get(["activeMediaTab", "latestMediaState"], (result) => {
+let preferredGlobal = { volume: null, muted: null };
+/** @type {Record<string, {volume:number|null, muted:boolean|null}>} */
+let preferredByPlatform = {};
+
+const OWNER_SWITCH_DELAY_MS = 900;
+
+/** @type {Map<number, {platform:string,isPlaying:boolean,lastPlayingAt:number,lastStateAt:number}>} */
+const mediaTabs = new Map();
+/** @type {Map<number, number>} */
+const promotionTimers = new Map();
+
+chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq"], (result) => {
+  if (typeof result.stateSeq === "number") stateSeq = result.stateSeq;
+  if (result.latestMediaState) lastBroadcastState = result.latestMediaState;
   if (result.activeMediaTab) {
-    chrome.tabs.get(result.activeMediaTab, (tab) => {
+    activeMediaTab = result.activeMediaTab;
+    chrome.tabs.get(activeMediaTab, (tab) => {
       if (chrome.runtime.lastError || !tab) {
-        chrome.storage.session.remove(["activeMediaTab", "latestMediaState"]);
-        return;
+        activeMediaTab = null;
+        chrome.storage.session.remove(["activeMediaTab"]);
       }
-      activeMediaTab = result.activeMediaTab;
     });
-  }
-  if (result.latestMediaState) {
-    lastBroadcastState = result.latestMediaState;
   }
 });
 
-// ─── Tab Tracking ─────────────────────────────────────────────────────────────
+chrome.storage.local.get(["vcSettings", "vcAudioPrefs"], (result) => {
+  const settings = result.vcSettings || {};
+  volumeMode = settings.volumeMode === "per-platform" ? "per-platform" : "global";
+  debugOwner = !!settings.debugOwner;
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!("audible" in changeInfo)) return;
-  if (!isSupportedSite(tab.url)) return;
-  if (changeInfo.audible === true && activeMediaTab === null) {
-    setActiveTab(tabId);
+  const prefs = result.vcAudioPrefs || {};
+  if (prefs.global && typeof prefs.global === "object") {
+    preferredGlobal = {
+      volume: isFiniteNumber(prefs.global.volume) ? clamp01(prefs.global.volume) : null,
+      muted: typeof prefs.global.muted === "boolean" ? prefs.global.muted : null
+    };
+  }
+  if (prefs.byPlatform && typeof prefs.byPlatform === "object") {
+    preferredByPlatform = prefs.byPlatform;
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url && !isSupportedSite(changeInfo.url)) {
+    mediaTabs.delete(tabId);
+    clearPromotionTimer(tabId);
+    if (tabId === activeMediaTab) recalcActiveTab();
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  mediaTabs.delete(tabId);
+  clearPromotionTimer(tabId);
   if (tabId === activeMediaTab) {
-    activeMediaTab = null;
-    chrome.storage.session.remove("activeMediaTab");
-    broadcastToAllTabs({ type: "ACTIVE_TAB_CLOSED" });
+    recalcActiveTab();
+    if (activeMediaTab === null) {
+      broadcastToAllTabs({ type: "ACTIVE_TAB_CLOSED" });
+    }
   }
 });
 
-// ─── Message Handling ─────────────────────────────────────────────────────────
-
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message.type) {
-
-    case "MEDIA_SESSION_ACTIVE": {
-      const tabId = sender.tab?.id;
-      if (tabId && isSupportedSite(sender.tab?.url)) {
-        setActiveTab(tabId);
-        sendResponse({ ok: true });
-      }
-      break;
-    }
-
     case "MEDIA_STATE_UPDATE": {
-      const tabId    = sender.tab?.id;
-      const newState = message.state;
-      if (!newState || !tabId) break;
-
-      // Register this tab as active as soon as it reports any state
-      // (not just when isPlaying — fixes "Loading..." stuck on paused start)
-      if (isSupportedSite(sender.tab?.url)) {
-        if (activeMediaTab === null || activeMediaTab === tabId) {
-          setActiveTab(tabId);
-        }
+      const tabId = sender.tab?.id;
+      const incoming = message.state;
+      if (!tabId || !incoming || !isSupportedSite(sender.tab?.url || "")) {
+        sendResponse?.({ ok: false, isActive: false, reason: "Unsupported sender" });
+        break;
       }
 
-      // Write to storage only on track change
+      const now = Date.now();
+      const prev = mediaTabs.get(tabId);
+      const transitionedToPlaying = !!incoming.isPlaying && !prev?.isPlaying;
+
+      if (tabId === activeMediaTab) {
+        updatePreferred(incoming.platform, {
+          volume: isFiniteNumber(incoming.volume) ? clamp01(incoming.volume) : undefined,
+          muted: typeof incoming.muted === "boolean" ? incoming.muted : undefined
+        });
+      }
+
+      mediaTabs.set(tabId, {
+        platform: incoming.platform || prev?.platform || "",
+        isPlaying: !!incoming.isPlaying,
+        lastPlayingAt: transitionedToPlaying ? now : (prev?.lastPlayingAt || 0),
+        lastStateAt: now
+      });
+
+      if (activeMediaTab === null) {
+        dlog("owner:init", { tabId, platform: incoming.platform });
+        setActiveTab(tabId, incoming);
+      } else if (tabId === activeMediaTab && !incoming.isPlaying) {
+        dlog("owner:active-stopped", { tabId });
+        recalcActiveTab();
+      } else if (transitionedToPlaying && tabId !== activeMediaTab) {
+        dlog("owner:promotion-scheduled", { from: activeMediaTab, to: tabId });
+        schedulePromotion(tabId);
+      }
+
+      const state = withStateMeta(incoming);
       if (
-        newState.title  !== lastBroadcastState?.title ||
-        newState.artist !== lastBroadcastState?.artist
+        state.title !== lastBroadcastState?.title ||
+        state.artist !== lastBroadcastState?.artist ||
+        state.artwork !== lastBroadcastState?.artwork
       ) {
-        chrome.storage.session.set({ latestMediaState: newState });
+        chrome.storage.session.set({ latestMediaState: state, stateSeq });
       }
 
-      // Always broadcast — the media tab itself needs updates on other tabs'
-      // islands. Throttling is only for progress ticks, not critical state.
-      if (shouldBroadcast(newState)) {
-        lastBroadcastState = newState;
-        // Broadcast to ALL tabs (including non-media tabs) so any open tab
-        // shows the island — excludes only the sender to avoid echo
-        broadcastToAllTabs({ type: "MEDIA_STATE_UPDATE", state: newState }, tabId);
+      if (tabId === activeMediaTab && shouldBroadcast(state)) {
+        lastBroadcastState = state;
+        broadcastToAllTabs({
+          type: "MEDIA_STATE_UPDATE",
+          state,
+          activeTabId: activeMediaTab
+        }, tabId);
       }
+
+      sendResponse({ ok: true, isActive: activeMediaTab === tabId, activeTabId: activeMediaTab });
       break;
     }
 
     case "MEDIA_ACTION": {
       if (activeMediaTab === null) {
-        sendResponse({ ok: false, error: "No active media tab" });
+        sendResponse({ ok: false, action: message.action, reason: "No active media tab" });
         return;
       }
+
+      const ownerPlatform = mediaTabs.get(activeMediaTab)?.platform || lastBroadcastState?.platform || "";
+      if (message.action === "setVolume" && isFiniteNumber(message.value)) {
+        updatePreferred(ownerPlatform, { volume: clamp01(message.value), muted: false });
+      } else if (message.action === "toggleMute") {
+        const currentMuted = resolvePreferred(ownerPlatform).muted;
+        const fallback = typeof lastBroadcastState?.muted === "boolean" ? lastBroadcastState.muted : false;
+        updatePreferred(ownerPlatform, { muted: !(typeof currentMuted === "boolean" ? currentMuted : fallback) });
+      } else if (message.action === "setMuted") {
+        updatePreferred(ownerPlatform, { muted: !!message.value });
+      }
+
       chrome.tabs.sendMessage(activeMediaTab, {
         type: "EXECUTE_MEDIA_ACTION",
         action: message.action,
         value: message.value
-      }).then(() => {
-        sendResponse({ ok: true });
+      }).then((result) => {
+        if (result?.ok === false) {
+          sendResponse({
+            ok: false,
+            action: message.action,
+            ownerTabId: activeMediaTab,
+            reason: result.reason || "Owner rejected action"
+          });
+          return;
+        }
+        sendResponse({ ok: true, action: message.action, ownerTabId: activeMediaTab });
       }).catch((err) => {
+        clearPromotionTimer(activeMediaTab);
+        mediaTabs.delete(activeMediaTab);
         activeMediaTab = null;
-        chrome.storage.session.remove("activeMediaTab");
-        sendResponse({ ok: false, error: err.message });
+        recalcActiveTab();
+        sendResponse({ ok: false, action: message.action, reason: err.message });
       });
-      return true; // async
+      return true;
     }
 
     case "FOCUS_MEDIA_TAB": {
@@ -121,44 +185,194 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (tab?.windowId) chrome.windows.update(tab.windowId, { focused: true });
         })
         .catch(() => {
+          mediaTabs.delete(activeMediaTab);
           activeMediaTab = null;
-          chrome.storage.session.remove("activeMediaTab");
+          recalcActiveTab();
         });
       break;
     }
 
     case "GET_INITIAL_STATE": {
-      chrome.storage.session.get("latestMediaState", (result) => {
-        sendResponse({
-          state:       result.latestMediaState || null,
-          activeTabId: activeMediaTab
-        });
+      sendResponse({
+        state: lastBroadcastState,
+        activeTabId: activeMediaTab,
+        settings: { volumeMode, debugOwner }
       });
-      return true; // async
+      break;
+    }
+
+    case "SETTINGS_GET": {
+      sendResponse({
+        ok: true,
+        settings: { volumeMode, debugOwner }
+      });
+      break;
+    }
+
+    case "SETTINGS_SET": {
+      if (message.settings?.volumeMode) {
+        volumeMode = message.settings.volumeMode === "per-platform" ? "per-platform" : "global";
+      }
+      if (typeof message.settings?.debugOwner === "boolean") {
+        debugOwner = message.settings.debugOwner;
+      }
+      persistSettings();
+      sendResponse({ ok: true, settings: { volumeMode, debugOwner } });
+      break;
     }
   }
 });
 
-// ─── Keyboard Shortcut ────────────────────────────────────────────────────────
-
 chrome.commands.onCommand.addListener((command) => {
-  if (command === "toggle-island") {
-    broadcastToAllTabs({ type: "TOGGLE_ISLAND" });
-  }
+  if (command === "toggle-island") broadcastToAllTabs({ type: "TOGGLE_ISLAND" });
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+function dlog(...args) {
+  if (debugOwner) console.debug("[VC][bg]", ...args);
+}
 
-function setActiveTab(tabId) {
+function withStateMeta(state) {
+  stateSeq += 1;
+  chrome.storage.session.set({ stateSeq });
+  return {
+    ...state,
+    _seq: stateSeq,
+    _stateAt: Date.now()
+  };
+}
+
+function setActiveTab(tabId, ownerState = null) {
   if (tabId === activeMediaTab) return;
+  dlog("owner:set", { from: activeMediaTab, to: tabId });
+  clearPromotionTimer(tabId);
   activeMediaTab = tabId;
   chrome.storage.session.set({ activeMediaTab: tabId });
 
-  // Tell the active tab it owns playback controls
-  chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
+  const platform = ownerState?.platform || mediaTabs.get(tabId)?.platform || "";
 
-  // Tell all other tabs they are observers
-  broadcastToAllTabs({ type: "ACTIVE_TAB_CHANGED" }, tabId);
+  if (ownerState) {
+    const ownerEnvelope = withStateMeta(ownerState);
+    lastBroadcastState = ownerEnvelope;
+    chrome.storage.session.set({ latestMediaState: ownerEnvelope, stateSeq });
+  }
+
+  chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
+  applyPreferredAudioToOwner(tabId, platform, ownerState);
+
+  broadcastToAllTabs({
+    type: "ACTIVE_TAB_CHANGED",
+    activeTabId: activeMediaTab,
+    state: lastBroadcastState
+  }, tabId);
+}
+
+function recalcActiveTab() {
+  const candidates = Array.from(mediaTabs.entries())
+    .filter(([, v]) => v.isPlaying)
+    .sort((a, b) => (b[1].lastPlayingAt - a[1].lastPlayingAt) || (b[1].lastStateAt - a[1].lastStateAt));
+
+  if (candidates.length === 0) {
+    dlog("owner:cleared");
+    activeMediaTab = null;
+    chrome.storage.session.remove("activeMediaTab");
+    return;
+  }
+
+  const [nextId] = candidates[0];
+  setActiveTab(nextId);
+}
+
+function schedulePromotion(tabId) {
+  clearPromotionTimer(tabId);
+  const timer = setTimeout(() => {
+    dlog("owner:promotion-fired", { tabId });
+    promotionTimers.delete(tabId);
+    const entry = mediaTabs.get(tabId);
+    if (!entry?.isPlaying) return;
+    if (activeMediaTab === tabId) return;
+    setActiveTab(tabId);
+  }, OWNER_SWITCH_DELAY_MS);
+  promotionTimers.set(tabId, timer);
+}
+
+function clearPromotionTimer(tabId) {
+  const timer = promotionTimers.get(tabId);
+  if (timer) {
+    clearTimeout(timer);
+    promotionTimers.delete(tabId);
+  }
+}
+
+function resolvePreferred(platform) {
+  if (volumeMode === "per-platform") {
+    const p = preferredByPlatform[platform] || {};
+    return {
+      volume: isFiniteNumber(p.volume) ? clamp01(p.volume) : null,
+      muted: typeof p.muted === "boolean" ? p.muted : null
+    };
+  }
+  return {
+    volume: isFiniteNumber(preferredGlobal.volume) ? clamp01(preferredGlobal.volume) : null,
+    muted: typeof preferredGlobal.muted === "boolean" ? preferredGlobal.muted : null
+  };
+}
+
+function updatePreferred(platform, patch = {}) {
+  if (volumeMode === "per-platform") {
+    const current = preferredByPlatform[platform] || { volume: null, muted: null };
+    preferredByPlatform[platform] = {
+      volume: patch.volume !== undefined ? (isFiniteNumber(patch.volume) ? clamp01(patch.volume) : null) : current.volume,
+      muted: patch.muted !== undefined ? !!patch.muted : current.muted
+    };
+  } else {
+    if (patch.volume !== undefined) {
+      preferredGlobal.volume = isFiniteNumber(patch.volume) ? clamp01(patch.volume) : null;
+    }
+    if (patch.muted !== undefined) {
+      preferredGlobal.muted = !!patch.muted;
+    }
+  }
+  persistAudioPrefs();
+}
+
+function applyPreferredAudioToOwner(tabId, platform, ownerState = null) {
+  const pref = resolvePreferred(platform);
+  const ownerVolume = isFiniteNumber(ownerState?.volume) ? clamp01(ownerState.volume) : null;
+  const ownerMuted = typeof ownerState?.muted === "boolean" ? ownerState.muted : null;
+
+  if (isFiniteNumber(pref.volume) && pref.volume !== ownerVolume) {
+    chrome.tabs.sendMessage(tabId, {
+      type: "EXECUTE_MEDIA_ACTION",
+      action: "setVolume",
+      value: pref.volume
+    }).catch(() => {});
+  }
+
+  if (typeof pref.muted === "boolean" && pref.muted !== ownerMuted) {
+    chrome.tabs.sendMessage(tabId, {
+      type: "EXECUTE_MEDIA_ACTION",
+      action: "setMuted",
+      value: pref.muted
+    }).catch(() => {});
+  }
+}
+
+function persistSettings() {
+  chrome.storage.local.set({
+    vcSettings: {
+      volumeMode,
+      debugOwner
+    }
+  });
+}
+
+function persistAudioPrefs() {
+  chrome.storage.local.set({
+    vcAudioPrefs: {
+      global: preferredGlobal,
+      byPlatform: preferredByPlatform
+    }
+  });
 }
 
 function isSupportedSite(url) {
@@ -167,7 +381,7 @@ function isSupportedSite(url) {
     const { hostname } = new URL(url);
     return (
       hostname === "www.youtube.com" ||
-      hostname === "youtube.com"     ||
+      hostname === "youtube.com" ||
       hostname === "music.youtube.com" ||
       hostname === "open.spotify.com" ||
       hostname === "spotify.com"
@@ -180,22 +394,16 @@ function isSupportedSite(url) {
 function shouldBroadcast(newState) {
   if (!lastBroadcastState) return true;
   const prev = lastBroadcastState;
-  if (newState.title    !== prev.title)    return true;
-  if (newState.artist   !== prev.artist)   return true;
+  if (newState.title !== prev.title) return true;
+  if (newState.artist !== prev.artist) return true;
   if (newState.isPlaying !== prev.isPlaying) return true;
   if (newState.platform !== prev.platform) return true;
-  if (newState.artwork  !== prev.artwork)  return true;
-  // Throttle progress-only ticks to 1s granularity
-  return Math.abs((newState.currentTime || 0) - (prev.currentTime || 0)) >= 1;
+  if (newState.artwork !== prev.artwork) return true;
+  if (newState.muted !== prev.muted) return true;
+  if ((newState.volume ?? null) !== (prev.volume ?? null)) return true;
+  return Math.abs((newState.currentTime || 0) - (prev.currentTime || 0)) >= 0.5;
 }
 
-/**
- * Broadcast to ALL open tabs — not just supported media sites.
- * This is what makes the island appear on non-media tabs (gmail, google, etc.)
- * The content script manifest covers only media sites, so non-media tabs won't
- * have the content script at all — those sendMessage calls will just fail
- * silently, which is fine.
- */
 function broadcastToAllTabs(message, excludeTabId = null) {
   chrome.tabs.query({}, (tabs) => {
     for (const tab of tabs) {
@@ -203,4 +411,12 @@ function broadcastToAllTabs(message, excludeTabId = null) {
       chrome.tabs.sendMessage(tab.id, message).catch(() => {});
     }
   });
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function isFiniteNumber(v) {
+  return typeof v === "number" && Number.isFinite(v);
 }

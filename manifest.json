@@ -3,29 +3,30 @@
   "name": "Volume Controller",
   "version": "1.0.0",
   "description": "Dynamic Island-style floating media controller for YouTube, YouTube Music, and Spotify.",
-
   "permissions": [
     "tabs",
     "storage"
   ],
-
   "host_permissions": [
     "<all_urls>"
   ],
-
   "background": {
     "service_worker": "background.js"
   },
-
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "css": ["island.css"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "island.css"
+      ],
       "run_at": "document_idle"
     }
   ],
-
   "commands": {
     "toggle-island": {
       "suggested_key": {
@@ -34,11 +35,10 @@
       "description": "Toggle floating island visibility"
     }
   },
-
   "action": {
-    "default_title": "Volume Controller"
+    "default_title": "Volume Controller",
+    "default_popup": "popup.html"
   },
-
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
