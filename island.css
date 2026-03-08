@@ -135,6 +135,24 @@
   overflow: hidden !important;
 }
 
+#vc-title-row {
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  min-width: 0 !important;
+}
+
+#vc-source-badge {
+  flex-shrink: 0 !important;
+  font-size: 10px !important;
+  font-weight: 600 !important;
+  padding: 2px 8px !important;
+  border-radius: 999px !important;
+  border: 1px solid var(--vc-border) !important;
+  color: var(--vc-text) !important;
+  background: rgba(255,255,255,0.08) !important;
+}
+
 #vc-title-scroll {
   overflow: hidden !important;
   white-space: nowrap !important;
@@ -296,6 +314,41 @@
   color: var(--vc-text) !important;
   letter-spacing: 0.02em !important;
   opacity: 0.95 !important;
+}
+
+#vc-volume-wrap {
+  margin-top: 8px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+}
+
+#vc-mute {
+  all: unset !important;
+  cursor: pointer !important;
+  width: 26px !important;
+  height: 26px !important;
+  border-radius: 7px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  background: rgba(255,255,255,0.10) !important;
+  color: var(--vc-text) !important;
+}
+
+#vc-volume {
+  flex: 1 !important;
+  accent-color: var(--vc-accent) !important;
+  cursor: pointer !important;
+}
+
+#vc-volume-wrap.vc-volume-disabled {
+  opacity: 0.45 !important;
+}
+
+#vc-volume-wrap.vc-volume-disabled #vc-volume,
+#vc-volume-wrap.vc-volume-disabled #vc-mute {
+  cursor: not-allowed !important;
 }
 
 /* ─── Platform accent themes ──────────────────────────────── */

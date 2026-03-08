@@ -43,6 +43,16 @@ const YouTube = {
     const v = this.getVideo();
     if (v && v.duration) v.currentTime = fraction * v.duration;
   },
+  setVolume(fraction) {
+    const v = this.getVideo();
+    if (!v) return;
+    v.volume = Math.max(0, Math.min(1, fraction));
+    if (v.volume > 0 && v.muted) v.muted = false;
+  },
+  toggleMute() {
+    const v = this.getVideo();
+    if (v) v.muted = !v.muted;
+  },
   getState() {
     const v = this.getVideo();
     if (!v) return null;
@@ -89,6 +99,16 @@ const YouTubeMusic = {
     const v = this.getVideo();
     if (v && v.duration) v.currentTime = fraction * v.duration;
   },
+  setVolume(fraction) {
+    const v = this.getVideo();
+    if (!v) return;
+    v.volume = Math.max(0, Math.min(1, fraction));
+    if (v.volume > 0 && v.muted) v.muted = false;
+  },
+  toggleMute() {
+    const v = this.getVideo();
+    if (v) v.muted = !v.muted;
+  },
   getState() {
     const v = this.getVideo();
     if (!v) return null;
@@ -125,6 +145,18 @@ const Spotify = {
     const y = rect.top  + rect.height / 2;
     bar.dispatchEvent(new MouseEvent("mousedown", { clientX: x, clientY: y, bubbles: true }));
     bar.dispatchEvent(new MouseEvent("mouseup",   { clientX: x, clientY: y, bubbles: true }));
+  },
+  setVolume(fraction) {
+    const bar = document.querySelector('[data-testid="volume-bar"] [role="slider"], [data-testid="volume-bar"]');
+    if (!bar) return;
+    const rect = bar.getBoundingClientRect();
+    const x = rect.left + Math.max(0, Math.min(1, fraction)) * rect.width;
+    const y = rect.top + rect.height / 2;
+    bar.dispatchEvent(new MouseEvent("mousedown", { clientX: x, clientY: y, bubbles: true }));
+    bar.dispatchEvent(new MouseEvent("mouseup", { clientX: x, clientY: y, bubbles: true }));
+  },
+  toggleMute() {
+    this._click('[data-testid="control-button-volume"], [aria-label*="Mute" i], [aria-label*="Unmute" i]');
   },
   getState() {
     const meta      = navigator.mediaSession?.metadata;
@@ -183,13 +215,20 @@ const Spotify = {
     } else if (pb) {
       currentTime = Math.max(0, Number.isFinite(currentTime) ? currentTime : 0);
     }
+    const volumeSlider = document.querySelector('[data-testid="volume-bar"] [role="slider"], [data-testid="volume-bar"] [aria-valuenow]');
+    const volumeNow = volumeSlider ? parseFloat(volumeSlider.getAttribute("aria-valuenow") || "") : NaN;
+    const volumeMax = volumeSlider ? parseFloat(volumeSlider.getAttribute("aria-valuemax") || "100") : 100;
+    const volume = Number.isFinite(volumeNow) && volumeMax > 0 ? Math.max(0, Math.min(1, volumeNow / volumeMax)) : null;
+    const muted = /unmute/i.test(document.querySelector('[data-testid="control-button-volume"], [aria-label*="mute" i]')?.getAttribute("aria-label") || "") || volume === 0;
+
     return {
       platform: "spotify",
       isPlaying, currentTime, duration,
       title:   meta?.title             || "",
       artist:  meta?.artist            || "",
       artwork: pickBestArtwork(meta?.artwork) || pickMetaImage() || "",
-      volume: null, muted: false
+      volume,
+      muted
     };
   }
 };
@@ -251,6 +290,7 @@ function detectPlatform() {
   let lastState        = null;
   let dom              = {};
   let pollingTimer     = null;
+  let lastSeqSeen      = 0;
 
   // ── Context validity guard ────────────────────────────────────
   // "Extension context invalidated" fires when the extension is reloaded while
@@ -285,7 +325,10 @@ function detectPlatform() {
 
   // Get any already-playing state from background
   safeSend({ type: "GET_INITIAL_STATE" }, (response) => {
-    if (response?.state) { renderState(response.state); showIsland(); }
+    if (response?.state) {
+      renderState(response.state);
+      showIsland();
+    }
   });
 
   // Media tabs start polling immediately
@@ -367,7 +410,9 @@ function detectPlatform() {
       case "pause":    platform.pause();     break;
       case "next":     platform.next();      break;
       case "previous": platform.previous();  break;
-      case "seek":     platform.seek(value); break;
+      case "seek":       platform.seek(value); break;
+      case "setVolume":  platform.setVolume?.(value); break;
+      case "toggleMute": platform.toggleMute?.(); break;
     }
     // Re-render after a short delay to pick up new state
     setTimeout(() => {
@@ -401,8 +446,11 @@ function detectPlatform() {
           <div id="vc-artwork-placeholder">♪</div>
         </div>
         <div id="vc-info">
-          <div id="vc-title-scroll">
-            <span id="vc-title">—</span>
+          <div id="vc-title-row">
+            <span id="vc-source-badge">Media</span>
+            <div id="vc-title-scroll">
+              <span id="vc-title">—</span>
+            </div>
           </div>
           <span id="vc-artist"></span>
         </div>
@@ -431,6 +479,10 @@ function detectPlatform() {
           <span id="vc-current-time">0:00</span>
           <span id="vc-duration">0:00</span>
         </div>
+        <div id="vc-volume-wrap">
+          <button id="vc-mute" aria-label="Mute / Unmute" title="Mute / Unmute">🔊</button>
+          <input id="vc-volume" type="range" min="0" max="100" step="1" value="100" aria-label="Volume" />
+        </div>
       </div>
     `;
 
@@ -442,6 +494,7 @@ function detectPlatform() {
       pill:         island.querySelector("#vc-pill"),
       title:        island.querySelector("#vc-title"),
       titleScroll:  island.querySelector("#vc-title-scroll"),
+      sourceBadge:  island.querySelector("#vc-source-badge"),
       artist:       island.querySelector("#vc-artist"),
       artwork:      island.querySelector("#vc-artwork"),
       artworkPH:    island.querySelector("#vc-artwork-placeholder"),
@@ -452,6 +505,9 @@ function detectPlatform() {
       progressThumb:island.querySelector("#vc-progress-thumb"),
       currentTime:  island.querySelector("#vc-current-time"),
       duration:     island.querySelector("#vc-duration"),
+      muteBtn:      island.querySelector("#vc-mute"),
+      volume:       island.querySelector("#vc-volume"),
+      volumeWrap:   island.querySelector("#vc-volume-wrap"),
     };
 
     // One-time entrance animation class
@@ -470,27 +526,17 @@ function detectPlatform() {
     dom.island.querySelector("#vc-playpause").addEventListener("click", (e) => {
       e.stopPropagation();
       const action = lastState?.isPlaying ? "pause" : "play";
-      if (isThisTabActive && platform) {
-        action === "pause" ? platform.pause() : platform.play();
-        // Optimistic UI update
-        setTimeout(() => { const s = platform.getState(); if (s) renderState(s); }, 150);
-      } else {
-        safeSend({ type: "MEDIA_ACTION", action });
-      }
+      safeSend({ type: "MEDIA_ACTION", action });
     });
 
     dom.island.querySelector("#vc-next").addEventListener("click", (e) => {
       e.stopPropagation();
-      isThisTabActive && platform
-        ? platform.next()
-        : safeSend({ type: "MEDIA_ACTION", action: "next" });
+      safeSend({ type: "MEDIA_ACTION", action: "next" });
     });
 
     dom.island.querySelector("#vc-prev").addEventListener("click", (e) => {
       e.stopPropagation();
-      isThisTabActive && platform
-        ? platform.previous()
-        : safeSend({ type: "MEDIA_ACTION", action: "previous" });
+      safeSend({ type: "MEDIA_ACTION", action: "previous" });
     });
 
     dom.island.querySelector("#vc-goto").addEventListener("click", (e) => {
@@ -518,12 +564,19 @@ function detectPlatform() {
     function doSeek(e) {
       const rect     = dom.progressBar.getBoundingClientRect();
       const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      if (isThisTabActive && platform) {
-        platform.seek(fraction);
-      } else {
-        safeSend({ type: "MEDIA_ACTION", action: "seek", value: fraction });
-      }
+      safeSend({ type: "MEDIA_ACTION", action: "seek", value: fraction });
     }
+
+    dom.muteBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      safeSend({ type: "MEDIA_ACTION", action: "toggleMute" });
+    });
+
+    dom.volume?.addEventListener("input", (e) => {
+      e.stopPropagation();
+      const fraction = Number(e.target.value || 0) / 100;
+      safeSend({ type: "MEDIA_ACTION", action: "setVolume", value: fraction });
+    });
 
     // ── Island drag ───────────────────────────────────────────
     // Use capture phase so YouTube's own mousedown doesn't swallow the event
@@ -560,6 +613,9 @@ function detectPlatform() {
 
   function renderState(state) {
     if (!state || !dom.island) return;
+    const seq = Number(state._seq || 0);
+    if (seq && seq < lastSeqSeen) return;
+    if (seq) lastSeqSeen = seq;
     lastState = state;
 
     // Title
@@ -574,6 +630,17 @@ function detectPlatform() {
 
     // Artist
     if (dom.artist) dom.artist.textContent = state.artist || "";
+
+    if (dom.sourceBadge) {
+      const sourceName = state.platform === "youtube-music"
+        ? "YouTube Music"
+        : state.platform === "youtube"
+          ? "YouTube"
+          : state.platform === "spotify"
+            ? "Spotify"
+            : "Media";
+      dom.sourceBadge.textContent = `Controlling: ${sourceName}`;
+    }
 
     // Artwork — only update src when it actually changes
     if (dom.artwork) {
@@ -601,6 +668,14 @@ function detectPlatform() {
     // Time labels
     if (dom.currentTime) dom.currentTime.textContent = fmtTime(state.currentTime);
     if (dom.duration)    dom.duration.textContent    = fmtTime(state.duration);
+
+    const hasVolume = typeof state.volume === "number" && !Number.isNaN(state.volume);
+    if (dom.volume) {
+      dom.volume.disabled = !hasVolume;
+      if (hasVolume) dom.volume.value = String(Math.round(state.volume * 100));
+    }
+    if (dom.volumeWrap) dom.volumeWrap.classList.toggle("vc-volume-disabled", !hasVolume);
+    if (dom.muteBtn) dom.muteBtn.textContent = state.muted ? "🔇" : "🔊";
 
     // Platform CSS theme
     dom.island.setAttribute("data-platform", state.platform || "");
