@@ -76,6 +76,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (typeof incoming.muted === "boolean") {
           preferredMuted = incoming.muted;
         }
+        if (typeof incoming.muted === "boolean") {
+          preferredMuted = incoming.muted;
+        }
+      }
+
+      mediaTabs.set(tabId, {
+        platform: incoming.platform || prev?.platform || "",
+        isPlaying: !!incoming.isPlaying,
+        lastPlayingAt: transitionedToPlaying ? now : (prev?.lastPlayingAt || 0),
+        lastStateAt: now
+      });
+
+      if (activeMediaTab === null) {
+        setActiveTab(tabId, incoming);
+      } else if (tabId === activeMediaTab && !incoming.isPlaying) {
+        recalcActiveTab();
+      } else if (transitionedToPlaying && tabId !== activeMediaTab) {
+        schedulePromotion(tabId);
       }
 
       mediaTabs.set(tabId, {
