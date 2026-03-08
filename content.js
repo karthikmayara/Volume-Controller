@@ -513,7 +513,7 @@ function detectPlatform() {
         </button>
       </div>
       <div id="vc-progress-wrap">
-        <div id="vc-progress-bar">
+        <div id="vc-progress-bar" tabindex="0" role="slider" aria-label="Playback progress">
           <div id="vc-progress-fill"></div>
           <div id="vc-progress-thumb"></div>
         </div>
@@ -613,6 +613,25 @@ function detectPlatform() {
       };
       document.addEventListener("mousemove", onMove, true);
       document.addEventListener("mouseup",   onUp,   true);
+    });
+
+    dom.progressBar.addEventListener("keydown", (e) => {
+      if (lastState?.capabilities?.canSeek === false) return;
+      const dur = Number(lastState?.duration || 0);
+      if (!dur) return;
+      let fraction = Math.max(0, Math.min(1, Number(lastState?.currentTime || 0) / dur));
+
+      if (e.key === "ArrowLeft") fraction -= 0.02;
+      else if (e.key === "ArrowRight") fraction += 0.02;
+      else if (e.key === "PageDown") fraction -= 0.1;
+      else if (e.key === "PageUp") fraction += 0.1;
+      else if (e.key === "Home") fraction = 0;
+      else if (e.key === "End") fraction = 1;
+      else return;
+
+      e.preventDefault();
+      fraction = Math.max(0, Math.min(1, fraction));
+      sendMediaAction("seek", fraction);
     });
 
     function doSeek(e) {
@@ -738,6 +757,11 @@ function detectPlatform() {
     const pct = dur > 0 ? ((state.currentTime / dur) * 100).toFixed(2) + "%" : "0%";
     if (dom.progressFill)  dom.progressFill.style.width = pct;
     if (dom.progressThumb) dom.progressThumb.style.left = pct;
+    if (dom.progressBar) {
+      dom.progressBar.setAttribute("aria-valuemin", "0");
+      dom.progressBar.setAttribute("aria-valuemax", "100");
+      dom.progressBar.setAttribute("aria-valuenow", String(Math.round((dur > 0 ? (state.currentTime / dur) : 0) * 100)));
+    }
 
     // Time labels
     if (dom.currentTime) dom.currentTime.textContent = fmtTime(state.currentTime);

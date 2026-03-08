@@ -10,20 +10,23 @@
 let activeMediaTab = null;
 let lastBroadcastState = null;
 let stateSeq = 0;
-let preferredVolume = null;
-let preferredMuted = null;
+
+let volumeMode = "global"; // global | per-platform
+let debugOwner = false;
+
+let preferredGlobal = { volume: null, muted: null };
+/** @type {Record<string, {volume:number|null, muted:boolean|null}>} */
+let preferredByPlatform = {};
+
 const OWNER_SWITCH_DELAY_MS = 900;
-const DEBUG_OWNER = false;
 
 /** @type {Map<number, {platform:string,isPlaying:boolean,lastPlayingAt:number,lastStateAt:number}>} */
 const mediaTabs = new Map();
 /** @type {Map<number, number>} */
 const promotionTimers = new Map();
 
-chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq", "preferredVolume", "preferredMuted"], (result) => {
+chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq"], (result) => {
   if (typeof result.stateSeq === "number") stateSeq = result.stateSeq;
-  if (typeof result.preferredVolume === "number") preferredVolume = result.preferredVolume;
-  if (typeof result.preferredMuted === "boolean") preferredMuted = result.preferredMuted;
   if (result.latestMediaState) lastBroadcastState = result.latestMediaState;
   if (result.activeMediaTab) {
     activeMediaTab = result.activeMediaTab;
@@ -33,6 +36,23 @@ chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq", "p
         chrome.storage.session.remove(["activeMediaTab"]);
       }
     });
+  }
+});
+
+chrome.storage.local.get(["vcSettings", "vcAudioPrefs"], (result) => {
+  const settings = result.vcSettings || {};
+  volumeMode = settings.volumeMode === "per-platform" ? "per-platform" : "global";
+  debugOwner = !!settings.debugOwner;
+
+  const prefs = result.vcAudioPrefs || {};
+  if (prefs.global && typeof prefs.global === "object") {
+    preferredGlobal = {
+      volume: isFiniteNumber(prefs.global.volume) ? clamp01(prefs.global.volume) : null,
+      muted: typeof prefs.global.muted === "boolean" ? prefs.global.muted : null
+    };
+  }
+  if (prefs.byPlatform && typeof prefs.byPlatform === "object") {
+    preferredByPlatform = prefs.byPlatform;
   }
 });
 
@@ -70,30 +90,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const transitionedToPlaying = !!incoming.isPlaying && !prev?.isPlaying;
 
       if (tabId === activeMediaTab) {
-        if (typeof incoming.volume === "number" && Number.isFinite(incoming.volume)) {
-          preferredVolume = clamp01(incoming.volume);
-        }
-        if (typeof incoming.muted === "boolean") {
-          preferredMuted = incoming.muted;
-        }
-        if (typeof incoming.muted === "boolean") {
-          preferredMuted = incoming.muted;
-        }
-      }
-
-      mediaTabs.set(tabId, {
-        platform: incoming.platform || prev?.platform || "",
-        isPlaying: !!incoming.isPlaying,
-        lastPlayingAt: transitionedToPlaying ? now : (prev?.lastPlayingAt || 0),
-        lastStateAt: now
-      });
-
-      if (activeMediaTab === null) {
-        setActiveTab(tabId, incoming);
-      } else if (tabId === activeMediaTab && !incoming.isPlaying) {
-        recalcActiveTab();
-      } else if (transitionedToPlaying && tabId !== activeMediaTab) {
-        schedulePromotion(tabId);
+        updatePreferred(incoming.platform, {
+          volume: isFiniteNumber(incoming.volume) ? clamp01(incoming.volume) : undefined,
+          muted: typeof incoming.muted === "boolean" ? incoming.muted : undefined
+        });
       }
 
       mediaTabs.set(tabId, {
@@ -142,14 +142,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      if (message.action === "setVolume" && typeof message.value === "number") {
-        preferredVolume = clamp01(message.value);
-        if (preferredVolume > 0) preferredMuted = false;
-        chrome.storage.session.set({ preferredVolume, preferredMuted });
-      }
-      if (message.action === "toggleMute") {
-        preferredMuted = typeof preferredMuted === "boolean" ? !preferredMuted : !(lastBroadcastState?.muted);
-        chrome.storage.session.set({ preferredMuted });
+      const ownerPlatform = mediaTabs.get(activeMediaTab)?.platform || lastBroadcastState?.platform || "";
+      if (message.action === "setVolume" && isFiniteNumber(message.value)) {
+        updatePreferred(ownerPlatform, { volume: clamp01(message.value), muted: false });
+      } else if (message.action === "toggleMute") {
+        const currentMuted = resolvePreferred(ownerPlatform).muted;
+        const fallback = typeof lastBroadcastState?.muted === "boolean" ? lastBroadcastState.muted : false;
+        updatePreferred(ownerPlatform, { muted: !(typeof currentMuted === "boolean" ? currentMuted : fallback) });
+      } else if (message.action === "setMuted") {
+        updatePreferred(ownerPlatform, { muted: !!message.value });
       }
 
       chrome.tabs.sendMessage(activeMediaTab, {
@@ -158,7 +159,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         value: message.value
       }).then((result) => {
         if (result?.ok === false) {
-          sendResponse({ ok: false, action: message.action, ownerTabId: activeMediaTab, reason: result.reason || "Owner rejected action" });
+          sendResponse({
+            ok: false,
+            action: message.action,
+            ownerTabId: activeMediaTab,
+            reason: result.reason || "Owner rejected action"
+          });
           return;
         }
         sendResponse({ ok: true, action: message.action, ownerTabId: activeMediaTab });
@@ -187,7 +193,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     case "GET_INITIAL_STATE": {
-      sendResponse({ state: lastBroadcastState, activeTabId: activeMediaTab });
+      sendResponse({
+        state: lastBroadcastState,
+        activeTabId: activeMediaTab,
+        settings: { volumeMode, debugOwner }
+      });
+      break;
+    }
+
+    case "SETTINGS_GET": {
+      sendResponse({
+        ok: true,
+        settings: { volumeMode, debugOwner }
+      });
+      break;
+    }
+
+    case "SETTINGS_SET": {
+      if (message.settings?.volumeMode) {
+        volumeMode = message.settings.volumeMode === "per-platform" ? "per-platform" : "global";
+      }
+      if (typeof message.settings?.debugOwner === "boolean") {
+        debugOwner = message.settings.debugOwner;
+      }
+      persistSettings();
+      sendResponse({ ok: true, settings: { volumeMode, debugOwner } });
       break;
     }
   }
@@ -198,7 +228,7 @@ chrome.commands.onCommand.addListener((command) => {
 });
 
 function dlog(...args) {
-  if (DEBUG_OWNER) console.debug("[VC][bg]", ...args);
+  if (debugOwner) console.debug("[VC][bg]", ...args);
 }
 
 function withStateMeta(state) {
@@ -218,6 +248,8 @@ function setActiveTab(tabId, ownerState = null) {
   activeMediaTab = tabId;
   chrome.storage.session.set({ activeMediaTab: tabId });
 
+  const platform = ownerState?.platform || mediaTabs.get(tabId)?.platform || "";
+
   if (ownerState) {
     const ownerEnvelope = withStateMeta(ownerState);
     lastBroadcastState = ownerEnvelope;
@@ -225,7 +257,8 @@ function setActiveTab(tabId, ownerState = null) {
   }
 
   chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
-  applyPreferredAudioToOwner(tabId, ownerState);
+  applyPreferredAudioToOwner(tabId, platform, ownerState);
+
   broadcastToAllTabs({
     type: "ACTIVE_TAB_CHANGED",
     activeTabId: activeMediaTab,
@@ -249,7 +282,6 @@ function recalcActiveTab() {
   setActiveTab(nextId);
 }
 
-
 function schedulePromotion(tabId) {
   clearPromotionTimer(tabId);
   const timer = setTimeout(() => {
@@ -271,29 +303,76 @@ function clearPromotionTimer(tabId) {
   }
 }
 
-function applyPreferredAudioToOwner(tabId, ownerState = null) {
-  const ownerVolume = typeof ownerState?.volume === "number" ? clamp01(ownerState.volume) : null;
+function resolvePreferred(platform) {
+  if (volumeMode === "per-platform") {
+    const p = preferredByPlatform[platform] || {};
+    return {
+      volume: isFiniteNumber(p.volume) ? clamp01(p.volume) : null,
+      muted: typeof p.muted === "boolean" ? p.muted : null
+    };
+  }
+  return {
+    volume: isFiniteNumber(preferredGlobal.volume) ? clamp01(preferredGlobal.volume) : null,
+    muted: typeof preferredGlobal.muted === "boolean" ? preferredGlobal.muted : null
+  };
+}
+
+function updatePreferred(platform, patch = {}) {
+  if (volumeMode === "per-platform") {
+    const current = preferredByPlatform[platform] || { volume: null, muted: null };
+    preferredByPlatform[platform] = {
+      volume: patch.volume !== undefined ? (isFiniteNumber(patch.volume) ? clamp01(patch.volume) : null) : current.volume,
+      muted: patch.muted !== undefined ? !!patch.muted : current.muted
+    };
+  } else {
+    if (patch.volume !== undefined) {
+      preferredGlobal.volume = isFiniteNumber(patch.volume) ? clamp01(patch.volume) : null;
+    }
+    if (patch.muted !== undefined) {
+      preferredGlobal.muted = !!patch.muted;
+    }
+  }
+  persistAudioPrefs();
+}
+
+function applyPreferredAudioToOwner(tabId, platform, ownerState = null) {
+  const pref = resolvePreferred(platform);
+  const ownerVolume = isFiniteNumber(ownerState?.volume) ? clamp01(ownerState.volume) : null;
   const ownerMuted = typeof ownerState?.muted === "boolean" ? ownerState.muted : null;
 
-  if (typeof preferredVolume === "number" && preferredVolume !== ownerVolume) {
+  if (isFiniteNumber(pref.volume) && pref.volume !== ownerVolume) {
     chrome.tabs.sendMessage(tabId, {
       type: "EXECUTE_MEDIA_ACTION",
       action: "setVolume",
-      value: preferredVolume
+      value: pref.volume
     }).catch(() => {});
   }
 
-  if (typeof preferredMuted === "boolean" && preferredMuted !== ownerMuted) {
+  if (typeof pref.muted === "boolean" && pref.muted !== ownerMuted) {
     chrome.tabs.sendMessage(tabId, {
       type: "EXECUTE_MEDIA_ACTION",
       action: "setMuted",
-      value: preferredMuted
+      value: pref.muted
     }).catch(() => {});
   }
 }
 
-function clamp01(value) {
-  return Math.max(0, Math.min(1, value));
+function persistSettings() {
+  chrome.storage.local.set({
+    vcSettings: {
+      volumeMode,
+      debugOwner
+    }
+  });
+}
+
+function persistAudioPrefs() {
+  chrome.storage.local.set({
+    vcAudioPrefs: {
+      global: preferredGlobal,
+      byPlatform: preferredByPlatform
+    }
+  });
 }
 
 function isSupportedSite(url) {
@@ -332,4 +411,12 @@ function broadcastToAllTabs(message, excludeTabId = null) {
       chrome.tabs.sendMessage(tab.id, message).catch(() => {});
     }
   });
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function isFiniteNumber(v) {
+  return typeof v === "number" && Number.isFinite(v);
 }

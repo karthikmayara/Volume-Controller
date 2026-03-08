@@ -377,6 +377,16 @@
   cursor: not-allowed !important;
 }
 
+
+#vc-controls button:focus-visible,
+#vc-goto:focus-visible,
+#vc-mute:focus-visible,
+#vc-volume:focus-visible,
+#vc-progress-bar:focus-visible {
+  outline: 2px solid var(--vc-accent) !important;
+  outline-offset: 2px !important;
+}
+
 /* ─── Platform accent themes ──────────────────────────────── */
 
 #vc-island[data-platform="youtube"] {

@@ -89,3 +89,17 @@ Expected:
 Expected:
 - While healthy: status briefly shows syncing and clears on ack.
 - After owner close: status shows actionable error message instead of silent fail.
+
+
+## Scenario L: Volume mode settings (popup)
+1. Open extension popup and select `Global` volume mode.
+2. Set low volume on YouTube, then switch owner to YouTube Music.
+
+Expected:
+- Owner tab volume is normalized to the same global level.
+
+3. Switch popup to `Per platform` mode.
+4. Set different volumes on YouTube and Spotify.
+
+Expected:
+- Each platform restores its own preferred level on ownership handoff.
