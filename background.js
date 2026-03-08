@@ -10,9 +10,12 @@
 let activeMediaTab = null;
 let lastBroadcastState = null;
 let stateSeq = 0;
+const OWNER_SWITCH_DELAY_MS = 900;
 
 /** @type {Map<number, {platform:string,isPlaying:boolean,lastPlayingAt:number,lastStateAt:number}>} */
 const mediaTabs = new Map();
+/** @type {Map<number, number>} */
+const promotionTimers = new Map();
 
 chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq"], (result) => {
   if (typeof result.stateSeq === "number") stateSeq = result.stateSeq;
@@ -28,25 +31,17 @@ chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq"], (
   }
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.url && !isSupportedSite(changeInfo.url)) {
     mediaTabs.delete(tabId);
-    if (tabId === activeMediaTab) recalcActiveTab();
-    return;
-  }
-
-  if (!("audible" in changeInfo)) return;
-  if (!isSupportedSite(tab?.url || "")) return;
-
-  if (changeInfo.audible === false) {
-    const existing = mediaTabs.get(tabId);
-    if (existing) existing.isPlaying = false;
+    clearPromotionTimer(tabId);
     if (tabId === activeMediaTab) recalcActiveTab();
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   mediaTabs.delete(tabId);
+  clearPromotionTimer(tabId);
   if (tabId === activeMediaTab) {
     recalcActiveTab();
     if (activeMediaTab === null) {
@@ -76,10 +71,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         lastStateAt: now
       });
 
-      if (transitionedToPlaying || activeMediaTab === null) {
-        setActiveTab(tabId);
+      if (activeMediaTab === null) {
+        setActiveTab(tabId, incoming);
       } else if (tabId === activeMediaTab && !incoming.isPlaying) {
         recalcActiveTab();
+      } else if (transitionedToPlaying && tabId !== activeMediaTab) {
+        schedulePromotion(tabId);
       }
 
       const state = withStateMeta(incoming);
@@ -91,7 +88,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.storage.session.set({ latestMediaState: state, stateSeq });
       }
 
-      if (shouldBroadcast(state)) {
+      if (tabId === activeMediaTab && shouldBroadcast(state)) {
         lastBroadcastState = state;
         broadcastToAllTabs({
           type: "MEDIA_STATE_UPDATE",
@@ -116,6 +113,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }).then(() => {
         sendResponse({ ok: true, ownerTabId: activeMediaTab });
       }).catch((err) => {
+        clearPromotionTimer(activeMediaTab);
         mediaTabs.delete(activeMediaTab);
         activeMediaTab = null;
         recalcActiveTab();
@@ -159,10 +157,17 @@ function withStateMeta(state) {
   };
 }
 
-function setActiveTab(tabId) {
+function setActiveTab(tabId, ownerState = null) {
   if (tabId === activeMediaTab) return;
+  clearPromotionTimer(tabId);
   activeMediaTab = tabId;
   chrome.storage.session.set({ activeMediaTab: tabId });
+
+  if (ownerState) {
+    const ownerEnvelope = withStateMeta(ownerState);
+    lastBroadcastState = ownerEnvelope;
+    chrome.storage.session.set({ latestMediaState: ownerEnvelope, stateSeq });
+  }
 
   chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
   broadcastToAllTabs({
@@ -183,7 +188,29 @@ function recalcActiveTab() {
     return;
   }
 
-  setActiveTab(candidates[0][0]);
+  const [nextId] = candidates[0];
+  setActiveTab(nextId);
+}
+
+
+function schedulePromotion(tabId) {
+  clearPromotionTimer(tabId);
+  const timer = setTimeout(() => {
+    promotionTimers.delete(tabId);
+    const entry = mediaTabs.get(tabId);
+    if (!entry?.isPlaying) return;
+    if (activeMediaTab === tabId) return;
+    setActiveTab(tabId);
+  }, OWNER_SWITCH_DELAY_MS);
+  promotionTimers.set(tabId, timer);
+}
+
+function clearPromotionTimer(tabId) {
+  const timer = promotionTimers.get(tabId);
+  if (timer) {
+    clearTimeout(timer);
+    promotionTimers.delete(tabId);
+  }
 }
 
 function isSupportedSite(url) {

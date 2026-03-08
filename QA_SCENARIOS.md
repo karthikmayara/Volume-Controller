@@ -54,3 +54,13 @@ Expected:
 
 Expected:
 - Island is not injectable there (Chrome restriction), and no crash occurs.
+
+
+## Scenario H: Flicker stabilization when switching paused/non-owner tab
+1. Play YouTube Music and YouTube.
+2. Pause YouTube and keep YouTube Music playing.
+3. Switch focus between tabs repeatedly without pressing play on YouTube.
+
+Expected:
+- Island should stay locked to the active owner (YouTube Music) with no title/artwork flicker.
+- Owner should not bounce due transient tab activation or delayed audible updates.
