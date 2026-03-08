@@ -53,6 +53,10 @@ const YouTube = {
     const v = this.getVideo();
     if (v) v.muted = !v.muted;
   },
+  setMuted(value) {
+    const v = this.getVideo();
+    if (v) v.muted = !!value;
+  },
   getState() {
     const v = this.getVideo();
     if (!v) return null;
@@ -109,6 +113,10 @@ const YouTubeMusic = {
     const v = this.getVideo();
     if (v) v.muted = !v.muted;
   },
+  setMuted(value) {
+    const v = this.getVideo();
+    if (v) v.muted = !!value;
+  },
   getState() {
     const v = this.getVideo();
     if (!v) return null;
@@ -157,6 +165,13 @@ const Spotify = {
   },
   toggleMute() {
     this._click('[data-testid="control-button-volume"], [aria-label*="Mute" i], [aria-label*="Unmute" i]');
+  },
+  setMuted(value) {
+    const btn = document.querySelector('[data-testid="control-button-volume"], [aria-label*="Mute" i], [aria-label*="Unmute" i]');
+    if (!btn) return;
+    const label = btn.getAttribute("aria-label") || "";
+    const currentlyMuted = /unmute/i.test(label);
+    if (currentlyMuted !== !!value) btn.click();
   },
   getState() {
     const meta      = navigator.mediaSession?.metadata;
@@ -413,6 +428,7 @@ function detectPlatform() {
       case "seek":       platform.seek(value); break;
       case "setVolume":  platform.setVolume?.(value); break;
       case "toggleMute": platform.toggleMute?.(); break;
+      case "setMuted":   platform.setMuted?.(value); break;
     }
     // Re-render after a short delay to pick up new state
     setTimeout(() => {

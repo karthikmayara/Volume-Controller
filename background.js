@@ -10,6 +10,8 @@
 let activeMediaTab = null;
 let lastBroadcastState = null;
 let stateSeq = 0;
+let preferredVolume = null;
+let preferredMuted = null;
 const OWNER_SWITCH_DELAY_MS = 900;
 
 /** @type {Map<number, {platform:string,isPlaying:boolean,lastPlayingAt:number,lastStateAt:number}>} */
@@ -17,8 +19,10 @@ const mediaTabs = new Map();
 /** @type {Map<number, number>} */
 const promotionTimers = new Map();
 
-chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq"], (result) => {
+chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq", "preferredVolume", "preferredMuted"], (result) => {
   if (typeof result.stateSeq === "number") stateSeq = result.stateSeq;
+  if (typeof result.preferredVolume === "number") preferredVolume = result.preferredVolume;
+  if (typeof result.preferredMuted === "boolean") preferredMuted = result.preferredMuted;
   if (result.latestMediaState) lastBroadcastState = result.latestMediaState;
   if (result.activeMediaTab) {
     activeMediaTab = result.activeMediaTab;
@@ -64,6 +68,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const prev = mediaTabs.get(tabId);
       const transitionedToPlaying = !!incoming.isPlaying && !prev?.isPlaying;
 
+      if (tabId === activeMediaTab) {
+        if (typeof incoming.volume === "number" && Number.isFinite(incoming.volume)) {
+          preferredVolume = clamp01(incoming.volume);
+        }
+        if (typeof incoming.muted === "boolean") {
+          preferredMuted = incoming.muted;
+        }
+      }
+
       mediaTabs.set(tabId, {
         platform: incoming.platform || prev?.platform || "",
         isPlaying: !!incoming.isPlaying,
@@ -106,6 +119,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: false, error: "No active media tab" });
         return;
       }
+
+      if (message.action === "setVolume" && typeof message.value === "number") {
+        preferredVolume = clamp01(message.value);
+        if (preferredVolume > 0) preferredMuted = false;
+        chrome.storage.session.set({ preferredVolume, preferredMuted });
+      }
+      if (message.action === "toggleMute") {
+        preferredMuted = typeof preferredMuted === "boolean" ? !preferredMuted : !(lastBroadcastState?.muted);
+        chrome.storage.session.set({ preferredMuted });
+      }
+
       chrome.tabs.sendMessage(activeMediaTab, {
         type: "EXECUTE_MEDIA_ACTION",
         action: message.action,
@@ -170,6 +194,7 @@ function setActiveTab(tabId, ownerState = null) {
   }
 
   chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
+  applyPreferredAudioToOwner(tabId, ownerState);
   broadcastToAllTabs({
     type: "ACTIVE_TAB_CHANGED",
     activeTabId: activeMediaTab,
@@ -211,6 +236,31 @@ function clearPromotionTimer(tabId) {
     clearTimeout(timer);
     promotionTimers.delete(tabId);
   }
+}
+
+function applyPreferredAudioToOwner(tabId, ownerState = null) {
+  const ownerVolume = typeof ownerState?.volume === "number" ? clamp01(ownerState.volume) : null;
+  const ownerMuted = typeof ownerState?.muted === "boolean" ? ownerState.muted : null;
+
+  if (typeof preferredVolume === "number" && preferredVolume !== ownerVolume) {
+    chrome.tabs.sendMessage(tabId, {
+      type: "EXECUTE_MEDIA_ACTION",
+      action: "setVolume",
+      value: preferredVolume
+    }).catch(() => {});
+  }
+
+  if (typeof preferredMuted === "boolean" && preferredMuted !== ownerMuted) {
+    chrome.tabs.sendMessage(tabId, {
+      type: "EXECUTE_MEDIA_ACTION",
+      action: "setMuted",
+      value: preferredMuted
+    }).catch(() => {});
+  }
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
 }
 
 function isSupportedSite(url) {
