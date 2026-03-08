@@ -1,97 +1,103 @@
 /**
  * background.js
- * Central state manager for the Volume Controller extension.
+ * Central media ownership + routing manager.
  *
- * Key fixes in this version:
- * - broadcastToAllContentScripts sends to ALL tabs (not just supported sites)
- *   so the island appears on any tab the user is browsing
- * - activeMediaTab promoted immediately on first MEDIA_STATE_UPDATE regardless
- *   of isPlaying, so paused-on-load state still registers the tab
- * - YOU_ARE_ACTIVE sent to active tab so it knows to act locally
- * - shouldBroadcast always passes through for the media tab's own updates
+ * Ownership rule:
+ * - last tab that transitions into playing becomes active owner
+ * - if owner stops/closes, fallback to most recently-playing remaining tab
  */
 
-let activeMediaTab    = null;
+let activeMediaTab = null;
 let lastBroadcastState = null;
+let stateSeq = 0;
+const OWNER_SWITCH_DELAY_MS = 900;
 
-// ─── Rehydrate on service worker restart ─────────────────────────────────────
+/** @type {Map<number, {platform:string,isPlaying:boolean,lastPlayingAt:number,lastStateAt:number}>} */
+const mediaTabs = new Map();
+/** @type {Map<number, number>} */
+const promotionTimers = new Map();
 
-chrome.storage.session.get(["activeMediaTab", "latestMediaState"], (result) => {
+chrome.storage.session.get(["activeMediaTab", "latestMediaState", "stateSeq"], (result) => {
+  if (typeof result.stateSeq === "number") stateSeq = result.stateSeq;
+  if (result.latestMediaState) lastBroadcastState = result.latestMediaState;
   if (result.activeMediaTab) {
-    chrome.tabs.get(result.activeMediaTab, (tab) => {
+    activeMediaTab = result.activeMediaTab;
+    chrome.tabs.get(activeMediaTab, (tab) => {
       if (chrome.runtime.lastError || !tab) {
-        chrome.storage.session.remove(["activeMediaTab", "latestMediaState"]);
-        return;
+        activeMediaTab = null;
+        chrome.storage.session.remove(["activeMediaTab"]);
       }
-      activeMediaTab = result.activeMediaTab;
     });
-  }
-  if (result.latestMediaState) {
-    lastBroadcastState = result.latestMediaState;
   }
 });
 
-// ─── Tab Tracking ─────────────────────────────────────────────────────────────
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!("audible" in changeInfo)) return;
-  if (!isSupportedSite(tab.url)) return;
-  if (changeInfo.audible === true && activeMediaTab === null) {
-    setActiveTab(tabId);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url && !isSupportedSite(changeInfo.url)) {
+    mediaTabs.delete(tabId);
+    clearPromotionTimer(tabId);
+    if (tabId === activeMediaTab) recalcActiveTab();
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  mediaTabs.delete(tabId);
+  clearPromotionTimer(tabId);
   if (tabId === activeMediaTab) {
-    activeMediaTab = null;
-    chrome.storage.session.remove("activeMediaTab");
-    broadcastToAllTabs({ type: "ACTIVE_TAB_CLOSED" });
+    recalcActiveTab();
+    if (activeMediaTab === null) {
+      broadcastToAllTabs({ type: "ACTIVE_TAB_CLOSED" });
+    }
   }
 });
 
-// ─── Message Handling ─────────────────────────────────────────────────────────
-
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message.type) {
-
-    case "MEDIA_SESSION_ACTIVE": {
-      const tabId = sender.tab?.id;
-      if (tabId && isSupportedSite(sender.tab?.url)) {
-        setActiveTab(tabId);
-        sendResponse({ ok: true });
-      }
-      break;
-    }
-
     case "MEDIA_STATE_UPDATE": {
-      const tabId    = sender.tab?.id;
-      const newState = message.state;
-      if (!newState || !tabId) break;
-
-      // Register this tab as active as soon as it reports any state
-      // (not just when isPlaying — fixes "Loading..." stuck on paused start)
-      if (isSupportedSite(sender.tab?.url)) {
-        if (activeMediaTab === null || activeMediaTab === tabId) {
-          setActiveTab(tabId);
-        }
+      const tabId = sender.tab?.id;
+      const incoming = message.state;
+      if (!tabId || !incoming || !isSupportedSite(sender.tab?.url || "")) {
+        sendResponse?.({ ok: false, isActive: false });
+        break;
       }
 
-      // Write to storage only on track change
+      const now = Date.now();
+      const prev = mediaTabs.get(tabId);
+      const transitionedToPlaying = !!incoming.isPlaying && !prev?.isPlaying;
+
+      mediaTabs.set(tabId, {
+        platform: incoming.platform || prev?.platform || "",
+        isPlaying: !!incoming.isPlaying,
+        lastPlayingAt: transitionedToPlaying ? now : (prev?.lastPlayingAt || 0),
+        lastStateAt: now
+      });
+
+      if (activeMediaTab === null) {
+        setActiveTab(tabId, incoming);
+      } else if (tabId === activeMediaTab && !incoming.isPlaying) {
+        recalcActiveTab();
+      } else if (transitionedToPlaying && tabId !== activeMediaTab) {
+        schedulePromotion(tabId);
+      }
+
+      const state = withStateMeta(incoming);
       if (
-        newState.title  !== lastBroadcastState?.title ||
-        newState.artist !== lastBroadcastState?.artist
+        state.title !== lastBroadcastState?.title ||
+        state.artist !== lastBroadcastState?.artist ||
+        state.artwork !== lastBroadcastState?.artwork
       ) {
-        chrome.storage.session.set({ latestMediaState: newState });
+        chrome.storage.session.set({ latestMediaState: state, stateSeq });
       }
 
-      // Always broadcast — the media tab itself needs updates on other tabs'
-      // islands. Throttling is only for progress ticks, not critical state.
-      if (shouldBroadcast(newState)) {
-        lastBroadcastState = newState;
-        // Broadcast to ALL tabs (including non-media tabs) so any open tab
-        // shows the island — excludes only the sender to avoid echo
-        broadcastToAllTabs({ type: "MEDIA_STATE_UPDATE", state: newState }, tabId);
+      if (tabId === activeMediaTab && shouldBroadcast(state)) {
+        lastBroadcastState = state;
+        broadcastToAllTabs({
+          type: "MEDIA_STATE_UPDATE",
+          state,
+          activeTabId: activeMediaTab
+        }, tabId);
       }
+
+      sendResponse({ ok: true, isActive: activeMediaTab === tabId, activeTabId: activeMediaTab });
       break;
     }
 
@@ -105,13 +111,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         action: message.action,
         value: message.value
       }).then(() => {
-        sendResponse({ ok: true });
+        sendResponse({ ok: true, ownerTabId: activeMediaTab });
       }).catch((err) => {
+        clearPromotionTimer(activeMediaTab);
+        mediaTabs.delete(activeMediaTab);
         activeMediaTab = null;
-        chrome.storage.session.remove("activeMediaTab");
+        recalcActiveTab();
         sendResponse({ ok: false, error: err.message });
       });
-      return true; // async
+      return true;
     }
 
     case "FOCUS_MEDIA_TAB": {
@@ -121,44 +129,88 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (tab?.windowId) chrome.windows.update(tab.windowId, { focused: true });
         })
         .catch(() => {
+          mediaTabs.delete(activeMediaTab);
           activeMediaTab = null;
-          chrome.storage.session.remove("activeMediaTab");
+          recalcActiveTab();
         });
       break;
     }
 
     case "GET_INITIAL_STATE": {
-      chrome.storage.session.get("latestMediaState", (result) => {
-        sendResponse({
-          state:       result.latestMediaState || null,
-          activeTabId: activeMediaTab
-        });
-      });
-      return true; // async
+      sendResponse({ state: lastBroadcastState, activeTabId: activeMediaTab });
+      break;
     }
   }
 });
 
-// ─── Keyboard Shortcut ────────────────────────────────────────────────────────
-
 chrome.commands.onCommand.addListener((command) => {
-  if (command === "toggle-island") {
-    broadcastToAllTabs({ type: "TOGGLE_ISLAND" });
-  }
+  if (command === "toggle-island") broadcastToAllTabs({ type: "TOGGLE_ISLAND" });
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+function withStateMeta(state) {
+  stateSeq += 1;
+  chrome.storage.session.set({ stateSeq });
+  return {
+    ...state,
+    _seq: stateSeq,
+    _stateAt: Date.now()
+  };
+}
 
-function setActiveTab(tabId) {
+function setActiveTab(tabId, ownerState = null) {
   if (tabId === activeMediaTab) return;
+  clearPromotionTimer(tabId);
   activeMediaTab = tabId;
   chrome.storage.session.set({ activeMediaTab: tabId });
 
-  // Tell the active tab it owns playback controls
-  chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
+  if (ownerState) {
+    const ownerEnvelope = withStateMeta(ownerState);
+    lastBroadcastState = ownerEnvelope;
+    chrome.storage.session.set({ latestMediaState: ownerEnvelope, stateSeq });
+  }
 
-  // Tell all other tabs they are observers
-  broadcastToAllTabs({ type: "ACTIVE_TAB_CHANGED" }, tabId);
+  chrome.tabs.sendMessage(tabId, { type: "YOU_ARE_ACTIVE" }).catch(() => {});
+  broadcastToAllTabs({
+    type: "ACTIVE_TAB_CHANGED",
+    activeTabId: activeMediaTab,
+    state: lastBroadcastState
+  }, tabId);
+}
+
+function recalcActiveTab() {
+  const candidates = Array.from(mediaTabs.entries())
+    .filter(([, v]) => v.isPlaying)
+    .sort((a, b) => (b[1].lastPlayingAt - a[1].lastPlayingAt) || (b[1].lastStateAt - a[1].lastStateAt));
+
+  if (candidates.length === 0) {
+    activeMediaTab = null;
+    chrome.storage.session.remove("activeMediaTab");
+    return;
+  }
+
+  const [nextId] = candidates[0];
+  setActiveTab(nextId);
+}
+
+
+function schedulePromotion(tabId) {
+  clearPromotionTimer(tabId);
+  const timer = setTimeout(() => {
+    promotionTimers.delete(tabId);
+    const entry = mediaTabs.get(tabId);
+    if (!entry?.isPlaying) return;
+    if (activeMediaTab === tabId) return;
+    setActiveTab(tabId);
+  }, OWNER_SWITCH_DELAY_MS);
+  promotionTimers.set(tabId, timer);
+}
+
+function clearPromotionTimer(tabId) {
+  const timer = promotionTimers.get(tabId);
+  if (timer) {
+    clearTimeout(timer);
+    promotionTimers.delete(tabId);
+  }
 }
 
 function isSupportedSite(url) {
@@ -167,7 +219,7 @@ function isSupportedSite(url) {
     const { hostname } = new URL(url);
     return (
       hostname === "www.youtube.com" ||
-      hostname === "youtube.com"     ||
+      hostname === "youtube.com" ||
       hostname === "music.youtube.com" ||
       hostname === "open.spotify.com" ||
       hostname === "spotify.com"
@@ -180,22 +232,16 @@ function isSupportedSite(url) {
 function shouldBroadcast(newState) {
   if (!lastBroadcastState) return true;
   const prev = lastBroadcastState;
-  if (newState.title    !== prev.title)    return true;
-  if (newState.artist   !== prev.artist)   return true;
+  if (newState.title !== prev.title) return true;
+  if (newState.artist !== prev.artist) return true;
   if (newState.isPlaying !== prev.isPlaying) return true;
   if (newState.platform !== prev.platform) return true;
-  if (newState.artwork  !== prev.artwork)  return true;
-  // Throttle progress-only ticks to 1s granularity
-  return Math.abs((newState.currentTime || 0) - (prev.currentTime || 0)) >= 1;
+  if (newState.artwork !== prev.artwork) return true;
+  if (newState.muted !== prev.muted) return true;
+  if ((newState.volume ?? null) !== (prev.volume ?? null)) return true;
+  return Math.abs((newState.currentTime || 0) - (prev.currentTime || 0)) >= 0.5;
 }
 
-/**
- * Broadcast to ALL open tabs — not just supported media sites.
- * This is what makes the island appear on non-media tabs (gmail, google, etc.)
- * The content script manifest covers only media sites, so non-media tabs won't
- * have the content script at all — those sendMessage calls will just fail
- * silently, which is fine.
- */
 function broadcastToAllTabs(message, excludeTabId = null) {
   chrome.tabs.query({}, (tabs) => {
     for (const tab of tabs) {
